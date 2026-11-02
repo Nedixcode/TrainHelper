@@ -47,7 +47,26 @@ def notify(text):
     r.raise_for_status()
 
 def get_station_code(name):
-    """Получает код станции по её названию через подсказки БЧ."""
+    """Получает код станции по ее названию через поиск БЧ."""
+    try:
+        r = requests.get(
+            "https://pass.rw.by/ru/ajax/sstation/",
+            params={"term": name},
+            headers=HEADERS,
+            timeout=10
+        )
+        data = r.json()
+        if isinstance(data, list) and len(data) > 0:
+            # Возвращаем express_id или id
+            for item in data:
+                if item.get("label", "").lower() == name.lower() or item.get("value", "").lower() == name.lower():
+                    return item.get("express_id") or item.get("id")
+            # Если точного совпадения по метке нет, берем первый попавшийся вариант
+            return data[0].get("express_id") or data[0].get("id")
+    except Exception:
+        pass
+    
+    # Запасной вариант через другой API подсказок
     try:
         r = requests.get(
             "https://pass.rw.by/api/v1/express/asn/s/",
@@ -60,6 +79,7 @@ def get_station_code(name):
             return data[0].get("express_code") or data[0].get("id")
     except Exception:
         pass
+        
     return None
 
 def fetch_trains(s):
