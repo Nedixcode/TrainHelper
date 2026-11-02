@@ -78,24 +78,25 @@ def fetch_trains(s):
     session = requests.Session()
     session.headers.update(HEADERS)
     
-    # Заходим на главную, чтобы получить куки и пройти первичную защиту
+    # Получаем сессионные куки
     try:
         session.get("https://pass.rw.by/ru/", timeout=15)
     except Exception:
         pass
 
     url = "https://pass.rw.by/api/v1/route/search/"
-    params = {
+    data = {
         "from": from_code,
         "to": to_code,
         "date": s["date"],
         "lang": "ru"
     }
-    r = session.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
     
-    trains_raw = data.get("tp", [])
+    r = session.post(url, data=data, timeout=20)
+    r.raise_for_status()
+    resp_data = r.json()
+    
+    trains_raw = resp_data.get("tp", [])
     result = []
     
     for t in trains_raw:
