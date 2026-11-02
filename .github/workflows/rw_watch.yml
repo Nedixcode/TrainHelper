@@ -2,8 +2,8 @@ name: rw-watch
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # каждые 10 минут (GitHub может задерживать запуск)
-  workflow_dispatch:          # ручной запуск: вкладка Actions → rw-watch → Run workflow
+    - cron: "*/5 * * * *"
+  workflow_dispatch:       # ручной запуск: вкладка Actions → rw-watch → Run workflow
     inputs:
       mode:
         description: "Действие: debug — только проверить, start — запустить слежение, stop — остановить"
