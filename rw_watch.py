@@ -13,14 +13,13 @@ CONFIG_FILE = os.getenv("RW_CONFIG", "watch.json")
 INTERVAL = int(os.getenv("RW_INTERVAL", "180"))
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://pass.rw.by/",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.9",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://pass.rw.by/ru/",
 }
 
-# Известные коды станций для надежности
 STATION_CODES = {
     "минск": "2100001",
     "минск-пассажирский": "2100001",
@@ -67,34 +66,6 @@ def get_station_code(name):
     clean_name = name.lower().strip()
     if clean_name in STATION_CODES:
         return STATION_CODES[clean_name]
-
-    # Если в словаре нет, пробуем запросить через API сайта
-    try:
-        r = requests.get(
-            "https://pass.rw.by/ru/ajax/sstation/",
-            params={"term": name},
-            headers=HEADERS,
-            timeout=10
-        )
-        data = r.json()
-        if isinstance(data, list) and len(data) > 0:
-            return data[0].get("express_id") or data[0].get("id")
-    except Exception:
-        pass
-    
-    try:
-        r = requests.get(
-            "https://pass.rw.by/api/v1/express/asn/s/",
-            params={"q": name, "lang": "ru"},
-            headers=HEADERS,
-            timeout=10
-        )
-        data = r.json()
-        if isinstance(data, list) and len(data) > 0:
-            return data[0].get("express_code") or data[0].get("id")
-    except Exception:
-        pass
-        
     return None
 
 def fetch_trains(s):
@@ -104,6 +75,15 @@ def fetch_trains(s):
     if not from_code or not to_code:
         raise Exception(f"Не удалось найти коды станций для '{s['from']}' или '{s['to']}'")
 
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
+    # Заходим на главную, чтобы получить куки и пройти первичную защиту
+    try:
+        session.get("https://pass.rw.by/ru/", timeout=15)
+    except Exception:
+        pass
+
     url = "https://pass.rw.by/api/v1/route/search/"
     params = {
         "from": from_code,
@@ -111,7 +91,7 @@ def fetch_trains(s):
         "date": s["date"],
         "lang": "ru"
     }
-    r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+    r = session.get(url, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
     
