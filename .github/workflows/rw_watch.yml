@@ -1,0 +1,111 @@
+name: rw-watch
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # каждые 10 минут (GitHub может задерживать запуск)
+  workflow_dispatch:          # ручной запуск: вкладка Actions → rw-watch → Run workflow
+    inputs:
+      mode:
+        description: "Действие: debug — только проверить, start — запустить слежение, stop — остановить"
+        type: choice
+        options: [debug, start, stop]
+        default: debug
+      from_station:
+        description: "Откуда (как на сайте), например: Минск"
+        required: false
+        type: string
+      to_station:
+        description: "Куда, например: Брест"
+        required: false
+        type: string
+      trip_date:
+        description: "Дата поездки ГГГГ-ММ-ДД, например: 2026-11-20"
+        required: false
+        type: string
+      train:
+        description: "Номер поезда, например: 649Б (можно несколько через запятую; пусто = любой)"
+        required: false
+        type: string
+
+permissions:
+  contents: write   # чтобы сохранять настройки в watch.json
+
+concurrency:
+  group: rw-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Настроить git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ---- mode = stop: удалить настройки, дальше слежение ничего не проверяет ----
+      - name: Остановить слежение
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'stop'
+        run: |
+          git rm -q -f --ignore-unmatch watch.json
+          if git diff --cached --quiet; then
+            echo "Слежение и так не было запущено."
+          else
+            git commit -q -m "Остановить слежение"
+            git push
+            echo "Слежение остановлено."
+          fi
+
+      # ---- mode = start: записать настройки в watch.json ----
+      - name: Записать настройки
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'start'
+        env:
+          RW_FROM: ${{ inputs.from_station }}
+          RW_TO: ${{ inputs.to_station }}
+          RW_DATE: ${{ inputs.trip_date }}
+          RW_TRAIN: ${{ inputs.train }}
+        run: |
+          if [ -z "$RW_FROM" ] || [ -z "$RW_TO" ] || [ -z "$RW_DATE" ]; then
+            echo "::error::Для start заполните «Откуда», «Куда» и «Дата поездки»."
+            exit 1
+          fi
+          jq -n --arg f "$RW_FROM" --arg t "$RW_TO" --arg d "$RW_DATE" --arg tr "$RW_TRAIN" \
+            '{from:$f, to:$t, date:$d, train:$tr}' > watch.json
+          cat watch.json
+
+      - uses: actions/setup-python@v5
+        if: inputs.mode != 'stop'
+        with:
+          python-version: "3.12"
+
+      - name: Установить зависимости
+        if: inputs.mode != 'stop'
+        run: pip install requests beautifulsoup4
+
+      # ---- проверка мест ----
+      # по расписанию поля пустые → скрипт берёт настройки из watch.json
+      - name: Проверить места
+        if: inputs.mode != 'stop'
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          RW_FROM: ${{ inputs.from_station }}
+          RW_TO: ${{ inputs.to_station }}
+          RW_DATE: ${{ inputs.trip_date }}
+          RW_TRAIN: ${{ inputs.train }}
+        run: python rw_watch.py ${{ inputs.mode == 'start' && '--once --hello' || inputs.mode == 'debug' && '--debug' || '--once' }}
+
+      # ---- mode = start: сохранить настройки в репозитории ----
+      - name: Сохранить настройки в репозитории
+        if: github.event_name == 'workflow_dispatch' && inputs.mode == 'start'
+        run: |
+          git add watch.json
+          if git diff --cached --quiet; then
+            echo "Настройки не изменились."
+          else
+            git commit -q -m "Обновить настройки слежения"
+            git push
+          fi
