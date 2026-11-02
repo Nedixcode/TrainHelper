@@ -1,40 +1,28 @@
 #!/usr/bin/env python3
 """
-Следит за свободными местами на pass.rw.by через их внутреннее API.
+Следит за свободными местами на pass.rw.by.
 """
 import json
 import os
+import re
 import sys
 import time
 from datetime import date, datetime
+from urllib.parse import urlencode
 import requests
+from bs4 import BeautifulSoup
 
 CONFIG_FILE = os.getenv("RW_CONFIG", "watch.json")
 INTERVAL = int(os.getenv("RW_INTERVAL", "180"))
+URL = "https://pass.rw.by/ru/route/"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.9",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": "https://pass.rw.by/ru/",
 }
 
-STATION_CODES = {
-    "минск": "2100001",
-    "минск-пассажирский": "2100001",
-    "лунинец": "2100360",
-    "брест": "2100050",
-    "брест-центральный": "2100050",
-    "гоммель": "2100080",
-    "гродно": "2100190",
-    "витебск": "2100100",
-    "могилев": "2100350",
-    "могилёв": "2100350",
-    "барановичи": "2100040",
-    "орша": "2100200",
-    "пинск": "2100430",
-}
+PRICE = re.compile(r"\d[\d\s]*,\d{2}\s*(byn|rub|eur|usd)", re.I)
 
 def load_settings():
     cfg = {}
@@ -52,7 +40,7 @@ def load_settings():
     return s
 
 def route_url(s):
-    return f"https://pass.rw.by/ru/route/?from={s['from']}&to={s['to']}&date={s['date']}"
+    return URL + "?" + urlencode({"from": s["from"], "to": s["to"], "date": s["date"]})
 
 def notify(text):
     r = requests.post(
@@ -62,90 +50,93 @@ def notify(text):
     )
     r.raise_for_status()
 
-def get_station_code(name):
-    clean_name = name.lower().strip()
-    if clean_name in STATION_CODES:
-        return STATION_CODES[clean_name]
-    return None
-
-def fetch_trains(s):
-    from_code = get_station_code(s["from"])
-    to_code = get_station_code(s["to"])
-    
-    if not from_code or not to_code:
-        raise Exception(f"Не удалось найти коды станций для '{s['from']}' или '{s['to']}'")
-
+def fetch_page(s):
     session = requests.Session()
     session.headers.update(HEADERS)
     
-    # Получаем сессионные куки
+    # Сначала заходим на главную для получения кук сессии
     try:
         session.get("https://pass.rw.by/ru/", timeout=15)
     except Exception:
         pass
 
-    url = "https://pass.rw.by/api/v1/route/search/"
-    data = {
-        "from": from_code,
-        "to": to_code,
-        "date": s["date"],
-        "lang": "ru"
-    }
-    
-    r = session.post(url, data=data, timeout=20)
+    params = {"from": s["from"], "to": s["to"], "date": s["date"]}
+    r = session.get(URL, params=params, headers=HEADERS, timeout=20)
     r.raise_for_status()
-    resp_data = r.json()
-    
-    trains_raw = resp_data.get("tp", [])
-    result = []
-    
-    for t in trains_raw:
-        train_num = t.get("number", "")
-        cars = t.get("cars", [])
-        free_seats_info = []
-        has_free = False
-        
-        for car in cars:
-            car_type = car.get("title", car.get("type", ""))
-            free_count = car.get("free_num", car.get("places_count", 0))
-            price = car.get("price", {})
-            cost = price.get("cost") or price.get("amount")
-            
-            if free_count and int(free_count) > 0:
-                has_free = True
-                free_seats_info.append(f"{car_type}: своб. {free_count}" + (f" ({cost})" if cost else ""))
-        
-        result.append({
-            "id": train_num,
-            "has_seats": has_free,
-            "text": f"Поезд {train_num}: " + (", ".join(free_seats_info) if free_seats_info else "Мест нет")
-        })
-        
-    return result
+    return r, BeautifulSoup(r.text, "html.parser")
 
-def wanted_list(s):
-    return [t.strip().lower() for t in s["train"].split(",") if t.strip()]
+def parse_trains(soup):
+    """Ищет блоки поездов на странице результатов."""
+    trains = []
+    # На сайте БЧ блоки поездов обычно имеют класс route-item или содержат данные о поезде
+    items = soup.find_all(class_=re.compile("route-item|train-row|card"))
+    if not items:
+        # Универсальный запасной поиск по тегам, если классы изменились
+        items = soup.find_all("div", text=re.compile(r"\d{3}[А-ЯA-Z]?"))
 
-def train_matches(train_id, wanted):
-    tid = train_id.lower()
-    for w in wanted:
-        if tid == w:
-            return True
-        if w.isdigit() and tid.startswith(w) and not tid[len(w):len(w) + 1].isdigit():
-            return True
-    return False
-
-def select_trains(s, trains):
-    wanted = wanted_list(s)
-    if not wanted:
-        return trains
-    return [t for t in trains if train_matches(t["id"], wanted)]
+    for item in soup.find_all(True):
+        text = item.get_text(" ", strip=True)
+        # Ищем номера поездов вида 658Б, 649 и т.д.
+        match = re.search(r"\b(\d{3}[А-ЯA-Z]?)\b", text)
+        if match and len(text) < 1000 and ("отправл" in text.lower() or "прибыт" in text.lower() or "мест" in text.lower()):
+            train_num = match.group(1)
+            # Проверим наличие цен или кнопки выбора мест
+            has_free = "выбрать места" in text.lower() or bool(PRICE.search(text))
+            trains.append({
+                "id": train_num,
+                "has_seats": has_free,
+                "text": text[:300]
+            })
+    return trains
 
 def check(s):
-    trains = select_trains(s, fetch_trains(s))
-    if not trains:
-        return "missing", "Поезд не найден в расписании на эту дату."
-    free = [t for t in trains if t["has_seats"]]
+    _, soup = fetch_page(s)
+    
+    # Ищем все элементы с информацией о поездах на новой верстке сайта
+    # На сайте pass.rw.by блоки поездов содержат ссылки на поезд или специфичные элементы
+    train_blocks = soup.select(".train-row, .route-item, [data-train]")
+    
+    results = []
+    # Альтернативный поиск по всему тексту страницы, если селекторы не сработали
+    page_text = soup.get_text("\n", strip=True)
+    
+    # Более надежный метод парсинга через поиск строк с номером поезда
+    for a in soup.find_all("a", href=re.compile("train=")):
+        parent = a.find_parent(class_=re.compile("item|row|card|train")) or a.parent
+        text = parent.get_text(" ", strip=True)
+        train_num_match = re.search(r"(\d{3}[А-ЯA-Z]?)", a.get_text() + " " + text)
+        if train_num_match:
+            t_num = train_num_match.group(1)
+            has_seats = "выбрать места" in text.lower() or bool(PRICE.search(text))
+            results.append({
+                "id": t_num,
+                "has_seats": has_seats,
+                "text": text
+            })
+
+    if not results:
+        return "missing", "Поезд не найден на странице (возможно, изменилась структура или защита сайта)."
+
+    wanted = [t.strip().lower() for t in s["train"].split(",") if t.strip()]
+    
+    filtered = []
+    for t in results:
+        tid = t["id"].lower()
+        matched = False
+        if not wanted:
+            matched = True
+        else:
+            for w in wanted:
+                if tid == w or (w.isdigit() and tid.startswith(w)):
+                    matched = True
+                    break
+        if matched:
+            filtered.append(t)
+
+    if not filtered:
+        return "missing", f"Указанный поезд ({s['train']}) не найден в выдаче."
+
+    free = [t for t in filtered if t["has_seats"]]
     if free:
         return "seats", free[0]["text"]
     return "none", "Мест нет."
@@ -160,17 +151,12 @@ def warn_window():
 def debug(s):
     print(f"Настройки: {describe(s)}")
     try:
-        all_trains = fetch_trains(s)
-        print(f"Поездов найдено через API: {len(all_trains)}")
-        selected = select_trains(s, all_trains)
-        for t in all_trains:
-            mark = "  <== ваш" if t in selected and s["train"] else ""
-            print(f"- {t['id']} | мест есть: {t['has_seats']}{mark}")
-            print(f"    {t['text']}")
+        r, soup = fetch_page(s)
+        print(f"HTTP статус: {r.status_code}, размер страницы: {len(r.text)}")
         status, info = check(s)
         print("Итог:", status, "|", info)
     except Exception as e:
-        print("Ошибка при запросе к API:", e)
+        print("Ошибка:", e)
 
 def main():
     once = "--once" in sys.argv
