@@ -13,11 +13,28 @@ CONFIG_FILE = os.getenv("RW_CONFIG", "watch.json")
 INTERVAL = int(os.getenv("RW_INTERVAL", "180"))
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "X-Requested-With": "XMLHttpRequest",
     "Referer": "https://pass.rw.by/",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.9",
+}
+
+# Известные коды станций для надежности
+STATION_CODES = {
+    "минск": "2100001",
+    "минск-пассажирский": "2100001",
+    "лунинец": "2100360",
+    "брест": "2100050",
+    "брест-центральный": "2100050",
+    "гоммель": "2100080",
+    "гродно": "2100190",
+    "витебск": "2100100",
+    "могилев": "2100350",
+    "могилёв": "2100350",
+    "барановичи": "2100040",
+    "орша": "2100200",
+    "пинск": "2100430",
 }
 
 def load_settings():
@@ -47,7 +64,11 @@ def notify(text):
     r.raise_for_status()
 
 def get_station_code(name):
-    """Получает код станции по ее названию через поиск БЧ."""
+    clean_name = name.lower().strip()
+    if clean_name in STATION_CODES:
+        return STATION_CODES[clean_name]
+
+    # Если в словаре нет, пробуем запросить через API сайта
     try:
         r = requests.get(
             "https://pass.rw.by/ru/ajax/sstation/",
@@ -57,16 +78,10 @@ def get_station_code(name):
         )
         data = r.json()
         if isinstance(data, list) and len(data) > 0:
-            # Возвращаем express_id или id
-            for item in data:
-                if item.get("label", "").lower() == name.lower() or item.get("value", "").lower() == name.lower():
-                    return item.get("express_id") or item.get("id")
-            # Если точного совпадения по метке нет, берем первый попавшийся вариант
             return data[0].get("express_id") or data[0].get("id")
     except Exception:
         pass
     
-    # Запасной вариант через другой API подсказок
     try:
         r = requests.get(
             "https://pass.rw.by/api/v1/express/asn/s/",
@@ -83,7 +98,6 @@ def get_station_code(name):
     return None
 
 def fetch_trains(s):
-    """Запрашивает расписание и наличие мест через API."""
     from_code = get_station_code(s["from"])
     to_code = get_station_code(s["to"])
     
