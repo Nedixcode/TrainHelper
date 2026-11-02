@@ -54,7 +54,6 @@ def fetch_page(s):
     session = requests.Session()
     session.headers.update(HEADERS)
     
-    # Сначала заходим на главную для получения кук сессии
     try:
         session.get("https://pass.rw.by/ru/", timeout=15)
     except Exception:
@@ -65,42 +64,10 @@ def fetch_page(s):
     r.raise_for_status()
     return r, BeautifulSoup(r.text, "html.parser")
 
-def parse_trains(soup):
-    """Ищет блоки поездов на странице результатов."""
-    trains = []
-    # На сайте БЧ блоки поездов обычно имеют класс route-item или содержат данные о поезде
-    items = soup.find_all(class_=re.compile("route-item|train-row|card"))
-    if not items:
-        # Универсальный запасной поиск по тегам, если классы изменились
-        items = soup.find_all("div", text=re.compile(r"\d{3}[А-ЯA-Z]?"))
-
-    for item in soup.find_all(True):
-        text = item.get_text(" ", strip=True)
-        # Ищем номера поездов вида 658Б, 649 и т.д.
-        match = re.search(r"\b(\d{3}[А-ЯA-Z]?)\b", text)
-        if match and len(text) < 1000 and ("отправл" in text.lower() or "прибыт" in text.lower() or "мест" in text.lower()):
-            train_num = match.group(1)
-            # Проверим наличие цен или кнопки выбора мест
-            has_free = "выбрать места" in text.lower() or bool(PRICE.search(text))
-            trains.append({
-                "id": train_num,
-                "has_seats": has_free,
-                "text": text[:300]
-            })
-    return trains
-
 def check(s):
-    _, soup = fetch_page(s)
-    
-    # Ищем все элементы с информацией о поездах на новой верстке сайта
-    # На сайте pass.rw.by блоки поездов содержат ссылки на поезд или специфичные элементы
-    train_blocks = soup.select(".train-row, .route-item, [data-train]")
+    r, soup = fetch_page(s)
     
     results = []
-    # Альтернативный поиск по всему тексту страницы, если селекторы не сработали
-    page_text = soup.get_text("\n", strip=True)
-    
-    # Более надежный метод парсинга через поиск строк с номером поезда
     for a in soup.find_all("a", href=re.compile("train=")):
         parent = a.find_parent(class_=re.compile("item|row|card|train")) or a.parent
         text = parent.get_text(" ", strip=True)
@@ -115,7 +82,9 @@ def check(s):
             })
 
     if not results:
-        return "missing", "Поезд не найден на странице (возможно, изменилась структура или защита сайта)."
+        # Возвращаем кусок текста страницы для отладки
+        page_preview = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))[:300]
+        return "missing", f"Поезд не найден. Текст страницы: {page_preview}"
 
     wanted = [t.strip().lower() for t in s["train"].split(",") if t.strip()]
     
@@ -153,6 +122,8 @@ def debug(s):
     try:
         r, soup = fetch_page(s)
         print(f"HTTP статус: {r.status_code}, размер страницы: {len(r.text)}")
+        print("Начало текста страницы:")
+        print(soup.get_text(" ", strip=True)[:400])
         status, info = check(s)
         print("Итог:", status, "|", info)
     except Exception as e:
