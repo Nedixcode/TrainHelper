@@ -3,7 +3,7 @@ name: rw-watch
 on:
   schedule:
     - cron: "*/5 * * * *"
-  workflow_dispatch:       # ручной запуск: вкладка Actions → rw-watch → Run workflow
+  workflow_dispatch:
     inputs:
       mode:
         description: "Действие: debug — только проверить, start — запустить слежение, stop — остановить"
@@ -28,7 +28,7 @@ on:
         type: string
 
 permissions:
-  contents: write   # чтобы сохранять настройки в watch.json
+  contents: write
 
 concurrency:
   group: rw-watch
@@ -37,7 +37,8 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 4
+
     steps:
       - uses: actions/checkout@v4
 
@@ -46,11 +47,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      # ---- mode = stop: удалить настройки, дальше слежение ничего не проверяет ----
+      # ---- Проверяем, что слежение настроено, когда запуск идёт по расписанию ----
+      - name: Проверить наличие настроек
+        if: github.event_name == 'schedule'
+        run: |
+          if [ ! -f watch.json ]; then
+            echo "::error::watch.json отсутствует. Запустите workflow вручную с mode=start."
+            exit 1
+          fi
+          echo "Текущие настройки:"
+          cat watch.json
+
+      # ---- mode = stop ----
       - name: Остановить слежение
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'stop'
         run: |
           git rm -q -f --ignore-unmatch watch.json
+
           if git diff --cached --quiet; then
             echo "Слежение и так не было запущено."
           else
@@ -59,7 +72,7 @@ jobs:
             echo "Слежение остановлено."
           fi
 
-      # ---- mode = start: записать настройки в watch.json ----
+      # ---- mode = start ----
       - name: Записать настройки
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'start'
         env:
@@ -72,8 +85,15 @@ jobs:
             echo "::error::Для start заполните «Откуда», «Куда» и «Дата поездки»."
             exit 1
           fi
-          jq -n --arg f "$RW_FROM" --arg t "$RW_TO" --arg d "$RW_DATE" --arg tr "$RW_TRAIN" \
+
+          jq -n \
+            --arg f "$RW_FROM" \
+            --arg t "$RW_TO" \
+            --arg d "$RW_DATE" \
+            --arg tr "$RW_TRAIN" \
             '{from:$f, to:$t, date:$d, train:$tr}' > watch.json
+
+          echo "Новые настройки:"
           cat watch.json
 
       - uses: actions/setup-python@v5
@@ -85,8 +105,7 @@ jobs:
         if: inputs.mode != 'stop'
         run: pip install requests beautifulsoup4
 
-      # ---- проверка мест ----
-      # по расписанию поля пустые → скрипт берёт настройки из watch.json
+      # ---- Проверка мест ----
       - name: Проверить места
         if: inputs.mode != 'stop'
         env:
@@ -96,16 +115,25 @@ jobs:
           RW_TO: ${{ inputs.to_station }}
           RW_DATE: ${{ inputs.trip_date }}
           RW_TRAIN: ${{ inputs.train }}
-        run: python rw_watch.py ${{ inputs.mode == 'start' && '--once --hello' || inputs.mode == 'debug' && '--debug' || '--once' }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "start" ]; then
+            python rw_watch.py --once --hello
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" = "debug" ]; then
+            python rw_watch.py --debug
+          else
+            python rw_watch.py --once
+          fi
 
-      # ---- mode = start: сохранить настройки в репозитории ----
+      # ---- mode = start: сохранить настройки ----
       - name: Сохранить настройки в репозитории
         if: github.event_name == 'workflow_dispatch' && inputs.mode == 'start'
         run: |
           git add watch.json
+
           if git diff --cached --quiet; then
             echo "Настройки не изменились."
-          else
-            git commit -q -m "Обновить настройки слежения"
-            git push
+            exit 0
           fi
+
+          git commit -q -m "Обновить настройки слежения"
+          git push
