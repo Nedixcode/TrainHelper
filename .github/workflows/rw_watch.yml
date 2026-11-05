@@ -34,7 +34,7 @@ on:
         type: string
 
 permissions:
-  contents: write   # скрипт переводит новое слежение из «ждёт выбора» в «активно» (запись в watch.json)
+  contents: read   # список слежений ведёт бот, workflow его только читает
 
 concurrency:
   group: rw-watch-${{ inputs.hello_id || inputs.mode || 'check' }}
@@ -68,7 +68,6 @@ jobs:
         if: steps.has.outputs.n != '0' || inputs.mode == 'debug'
         env:
           TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           MODE: ${{ inputs.mode }}
           RW_HELLO_ID: ${{ inputs.hello_id }}
           RW_FROM: ${{ inputs.from_station }}
