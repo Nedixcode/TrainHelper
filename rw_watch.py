@@ -7,31 +7,28 @@
                 "date": "2026-11-08", "train": "658Б",
                 "state": "active" | "pending", "created": 1700000000000}, ...]}
 Список ведёт Telegram-бот (Cloudflare Worker); у каждого слежения свой chat.
+Скрипт watch.json только читает.
 
 Состояния:
-  pending — слежение только что создано и ждёт решения пользователя (обычные
-            проверки такие слежения пропускают; бот сам снимает их через ~полчаса);
-  active  — слежение работает: если есть места, уведомление приходит при каждой проверке.
+  pending — слежение создано, но НЕ запущено: ждёт нажатия «Начать отслеживание»
+            (обычные проверки такие слежения пропускают; бот сам снимает их через ~полчаса);
+  active  — слежение запущено: если есть места, уведомление приходит при каждой проверке.
 
 Режимы:
   --once     одна проверка всех активных слежений (для GitHub Actions).
              Если задан RW_HELLO_ID — проверяется только это слежение (первая проверка):
-               • места есть  -> слежение остаётся pending, пользователю приходят кнопки
-                                «Не отслеживать / Начать отслеживание»;
-               • мест нет    -> слежение сразу становится active, кнопки приходят тоже.
+             пользователю приходит результат (места есть / нет / поезд не найден) и
+             одна кнопка «Начать отслеживание». Слежение само не запускается.
   --debug    показать, что скрипт видит на странице, ничего не отправляя
   без флагов работает постоянно (проверка раз в RW_INTERVAL секунд)
 
 Переменные окружения:
-  TG_TOKEN                 токен бота
-  RW_HELLO_ID              id слежения для первой проверки
-  GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_REF_NAME  (задаёт GitHub Actions) —
-                           нужны, чтобы перевести слежение из pending в active
-  RW_CONFIG                путь к локальному watch.json (по умолчанию watch.json)
+  TG_TOKEN     токен бота
+  RW_HELLO_ID  id слежения для первой проверки
+  RW_CONFIG    путь к watch.json (по умолчанию watch.json)
 
 Установка: pip install requests beautifulsoup4
 """
-import base64
 import json
 import os
 import re
@@ -44,7 +41,6 @@ import requests
 from bs4 import BeautifulSoup
 
 CONFIG_FILE = os.getenv("RW_CONFIG", "watch.json")
-DATA_PATH = "watch.json"  # путь файла в репозитории (для GitHub API)
 INTERVAL = int(os.getenv("RW_INTERVAL", "180"))  # для постоянного режима, сек
 URL = "https://pass.rw.by/ru/route/"
 HEADERS = {
@@ -96,7 +92,7 @@ def pretty_date(s):
 
 
 def card(w):
-    return f"🚆 {w['from']} → {w['to']}\n📅 {pretty_date(w['date'])} · поезд: {w['train'] or 'любой'}"
+    return f"{w['from']} → {w['to']}\n{pretty_date(w['date'])} · поезд: {w['train'] or 'любой'}"
 
 
 def describe(w):
@@ -124,70 +120,9 @@ def safe_notify(chat, text, buttons=None):
         print("Не удалось отправить сообщение:", type(e).__name__)
 
 
-def choice_buttons(watch_id):
-    return [[{"text": "❌ Не отслеживать", "callback_data": f"no:{watch_id}"},
-             {"text": "✅ Начать отслеживание", "callback_data": f"go:{watch_id}"}]]
-
-
-# ---------- запись в watch.json через GitHub API ----------
-
-def _gh_headers():
-    return {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "rw-watch-script"}
-
-
-def update_watches(mutate, message):
-    """Читает watch.json из репозитория, применяет mutate(list) -> новый список или None
-    (ничего менять не нужно) и записывает с проверкой версии. При конфликте повторяет."""
-    repo = os.environ["GITHUB_REPOSITORY"]
-    branch = os.getenv("GITHUB_REF_NAME") or "main"
-    url = f"https://api.github.com/repos/{repo}/contents/{DATA_PATH}"
-    for attempt in range(4):
-        r = requests.get(url, params={"ref": branch}, headers=_gh_headers(), timeout=20)
-        if r.status_code == 404:
-            return False
-        r.raise_for_status()
-        j = r.json()
-        data = json.loads(base64.b64decode(j["content"]).decode("utf-8"))
-        watches = data.get("watches") if isinstance(data, dict) else None
-        new = mutate(list(watches or []))
-        if new is None:
-            return True
-        content = json.dumps({"watches": new}, ensure_ascii=False, indent=2) + "\n"
-        body = {"message": message, "branch": branch, "sha": j["sha"],
-                "content": base64.b64encode(content.encode("utf-8")).decode("ascii")}
-        p = requests.put(url, json=body, headers=_gh_headers(), timeout=20)
-        if p.status_code in (200, 201):
-            return True
-        if p.status_code in (409, 422):  # кто-то изменил файл раньше — повторим
-            time.sleep(0.5 * (attempt + 1))
-            continue
-        p.raise_for_status()
-    return False
-
-
-def activate(watch_id):
-    """pending -> active. True, если слежение теперь активно; False — не удалось или оно уже снято."""
-    found = {"ok": False}
-
-    def mutate(ws):
-        changed = False
-        for w in ws:
-            if str(w.get("id")) == watch_id:
-                found["ok"] = True
-                if w.get("state") == "pending":
-                    w["state"] = "active"
-                    changed = True
-        return ws if changed else None
-
-    try:
-        done = update_watches(mutate, "Начать отслеживание")
-    except Exception as e:
-        print("Не удалось активировать слежение:", type(e).__name__, e)
-        return False
-    return bool(done and found["ok"])
+def start_button(watch_id):
+    """Единственная кнопка: слежение запускает Worker, когда её нажимают."""
+    return [[{"text": "Начать отслеживание", "callback_data": f"go:{watch_id}"}]]
 
 
 # ---------- разбор страницы ----------
@@ -301,33 +236,25 @@ def warn_window():
 # ---------- первая проверка нового слежения ----------
 
 def first_check(w, status, info, error=None):
-    """Первое сообщение по новому слежению. Места есть — спрашиваем (слежение остаётся
-    pending). Мест нет / поезд не найден / сайт не ответил — запускаем слежение сами."""
+    """Результат первой проверки. Слежение НЕ запускается: пользователь видит, что
+    на сайте, и одну кнопку «Начать отслеживание». Отменить можно командой /stop."""
     link = route_url(w)
-    buttons = choice_buttons(w["id"])
+    footer = ("Если не нажмёшь кнопку, слежение не запустится. Отменить слежение: /stop")
 
-    if error is None and status == "seats":
-        safe_notify(w["chat"],
-                    f"🟢 Места уже есть!\n{card(w)}\n\nНа сайте: {info}\nКупить: {link}\n\n"
-                    "Начать отслеживание? Если не выберешь, слежение не запустится "
-                    "(кнопки действуют около получаса).",
-                    buttons)
-        return
-
-    activated = activate(w["id"])
     if error is not None:
-        head = f"❌ Не удалось проверить сайт сейчас: {error}\nСлежение запущено — проверю при следующей проверке."
+        text = (f"Не удалось проверить сайт: {error}\nСлежение не запущено.\n{card(w)}\n\n"
+                f"Нажми «Начать отслеживание», и я проверю при следующей проверке.\n{footer}")
+    elif status == "seats":
+        text = (f"Места есть, но слежение не запущено.\n{card(w)}\n\nНа сайте: {info}\nКупить: {link}\n\n"
+                f"Нажми «Начать отслеживание», чтобы я напоминал о местах раз в 10 минут.\n{footer}")
     elif status == "missing":
-        head = f"🟡 {info}\nСлежение запущено — напишу, если поезд появится и будут места."
+        text = (f"Слежение не запущено.\n{card(w)}\n\n{info}\n\n"
+                f"Если билеты ещё не в продаже, нажми «Начать отслеживание»: я напишу, когда "
+                f"поезд появится и будут места.\n{footer}")
     else:
-        head = "🔴 Сейчас мест нет — слежение запущено."
-    if not activated:
-        head = ("⚠️ Не удалось запустить слежение автоматически — нажми «Начать отслеживание».\n"
-                + head.split("\n")[0])
-    safe_notify(w["chat"],
-                f"{head}\n{card(w)}\n\nПроверяю раз в ~10 минут и напишу, как только появятся места.\n"
-                f"Билеты: {link}",
-                buttons)
+        text = (f"Мест нет. Слежение не запущено.\n{card(w)}\n\nБилеты: {link}\n\n"
+                f"Нажми «Начать отслеживание», и я напишу, когда появятся места.\n{footer}")
+    safe_notify(w["chat"], text, start_button(w["id"]))
 
 
 # ---------- прогоны ----------
@@ -346,7 +273,7 @@ def run_once(hello_id=""):
         if hello_id and not hello:
             continue
         if not hello_id and w["state"] == "pending":
-            continue  # ждёт решения пользователя
+            continue  # не запущено: ждёт нажатия «Начать отслеживание»
         try:
             trip = datetime.strptime(w["date"], "%Y-%m-%d").date()
         except ValueError:
@@ -366,9 +293,9 @@ def run_once(hello_id=""):
             first_check(w, status, info)
         elif status == "seats":
             safe_notify(w["chat"],
-                        f"🟢 Появились места!\n{card(w)}\n\nНа сайте: {info}\nКупить: {route_url(w)}")
+                        f"Появились места!\n{card(w)}\n\nНа сайте: {info}\nКупить: {route_url(w)}")
         elif status == "missing" and warn_ok:
-            safe_notify(w["chat"], f"⚠️ Не нашёл поезд на странице\n{card(w)}\n\n{info}")
+            safe_notify(w["chat"], f"Не нашёл поезд на странице\n{card(w)}\n\n{info}")
 
 
 def debug():
