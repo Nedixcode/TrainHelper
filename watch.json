@@ -17,6 +17,16 @@
       "train": "860Б",
       "state": "active",
       "created": 1793837949501
+    },
+    {
+      "id": "mw3bxdt7b1g",
+      "chat": "5138748630",
+      "from": "Лунинец",
+      "to": "Минск",
+      "date": "2026-11-08",
+      "train": "872Б",
+      "state": "pending",
+      "created": 1793870076715
     }
   ]
 }
