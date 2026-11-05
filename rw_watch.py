@@ -4,25 +4,34 @@
 
 Слежения лежат в watch.json:
   {"watches": [{"id": "...", "chat": "123456", "from": "Лунинец", "to": "Минск",
-                "date": "2026-11-08", "train": "658Б"}, ...]}
-Список ведёт Telegram-бот (Cloudflare Worker); у каждого слежения свой chat —
-именно туда придёт уведомление.
+                "date": "2026-11-08", "train": "658Б",
+                "state": "active" | "pending", "created": 1700000000000}, ...]}
+Список ведёт Telegram-бот (Cloudflare Worker); у каждого слежения свой chat.
+
+Состояния:
+  pending — слежение только что создано и ждёт решения пользователя (обычные
+            проверки такие слежения пропускают; бот сам снимает их через ~полчаса);
+  active  — слежение работает: если есть места, уведомление приходит при каждой проверке.
 
 Режимы:
-  --once     одна проверка всех слежений (для GitHub Actions)
-  --debug    показать, что скрипт видит на странице, ничего не отправляя;
-             можно задать RW_FROM, RW_TO, RW_DATE, RW_TRAIN (иначе берётся
-             первое слежение из watch.json)
+  --once     одна проверка всех активных слежений (для GitHub Actions).
+             Если задан RW_HELLO_ID — проверяется только это слежение (первая проверка):
+               • места есть  -> слежение остаётся pending, пользователю приходят кнопки
+                                «Не отслеживать / Начать отслеживание»;
+               • мест нет    -> слежение сразу становится active, кнопки приходят тоже.
+  --debug    показать, что скрипт видит на странице, ничего не отправляя
   без флагов работает постоянно (проверка раз в RW_INTERVAL секунд)
 
 Переменные окружения:
-  TG_TOKEN       токен бота (нужен для отправки сообщений)
-  RW_HELLO_ID    если задан — проверить только слежение с этим id и прислать
-                 владельцу статус «слежу…» (так бот подтверждает новое слежение)
-  RW_CONFIG      путь к файлу слежений (по умолчанию watch.json)
+  TG_TOKEN                 токен бота
+  RW_HELLO_ID              id слежения для первой проверки
+  GITHUB_TOKEN, GITHUB_REPOSITORY, GITHUB_REF_NAME  (задаёт GitHub Actions) —
+                           нужны, чтобы перевести слежение из pending в active
+  RW_CONFIG                путь к локальному watch.json (по умолчанию watch.json)
 
 Установка: pip install requests beautifulsoup4
 """
+import base64
 import json
 import os
 import re
@@ -35,6 +44,7 @@ import requests
 from bs4 import BeautifulSoup
 
 CONFIG_FILE = os.getenv("RW_CONFIG", "watch.json")
+DATA_PATH = "watch.json"  # путь файла в репозитории (для GitHub API)
 INTERVAL = int(os.getenv("RW_INTERVAL", "180"))  # для постоянного режима, сек
 URL = "https://pass.rw.by/ru/route/"
 HEADERS = {
@@ -44,6 +54,8 @@ HEADERS = {
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.9",
 }
 PRICE = re.compile(r"\d[\d\s]*,\d{2}\s*(byn|rub|eur|usd)", re.I)
+MONTHS = ["января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа",
+          "сентября", "октября", "ноября", "декабря"]
 
 
 # ---------- слежения ----------
@@ -63,7 +75,9 @@ def load_watches():
     for w in items or []:
         if not isinstance(w, dict):
             continue
-        item = {k: str(w.get(k, "")).strip() for k in ("id", "chat", "from", "to", "date", "train")}
+        item = {k: str(w.get(k, "")).strip()
+                for k in ("id", "chat", "from", "to", "date", "train", "state")}
+        item["state"] = item["state"] or "active"  # записи без state — активные
         if item["chat"] and item["from"] and item["to"] and item["date"]:
             result.append(item)
     return result
@@ -73,27 +87,107 @@ def route_url(w):
     return URL + "?" + urlencode({"from": w["from"], "to": w["to"], "date": w["date"]})
 
 
+def pretty_date(s):
+    try:
+        y, m, d = s.split("-")
+        return f"{int(d)} {MONTHS[int(m) - 1]} {y}"
+    except Exception:
+        return s
+
+
+def card(w):
+    return f"🚆 {w['from']} → {w['to']}\n📅 {pretty_date(w['date'])} · поезд: {w['train'] or 'любой'}"
+
+
 def describe(w):
     return f"{w['from']} → {w['to']}, {w['date']}, поезд: {w['train'] or 'любой'}"
 
 
 # ---------- Telegram ----------
 
-def notify(chat, text):
+def notify(chat, text, buttons=None):
+    data = {"chat_id": chat, "text": text, "disable_web_page_preview": "true"}
+    if buttons:
+        data["reply_markup"] = json.dumps({"inline_keyboard": buttons})
     r = requests.post(
         f"https://api.telegram.org/bot{os.environ['TG_TOKEN']}/sendMessage",
-        data={"chat_id": chat, "text": text, "disable_web_page_preview": "true"},
-        timeout=15,
+        data=data, timeout=15,
     )
     r.raise_for_status()
 
 
-def safe_notify(chat, text):
+def safe_notify(chat, text, buttons=None):
     """Одна недоставленная отправка (например, бот заблокирован) не должна ломать остальные."""
     try:
-        notify(chat, text)
+        notify(chat, text, buttons)
     except Exception as e:
         print("Не удалось отправить сообщение:", type(e).__name__)
+
+
+def choice_buttons(watch_id):
+    return [[{"text": "❌ Не отслеживать", "callback_data": f"no:{watch_id}"},
+             {"text": "✅ Начать отслеживание", "callback_data": f"go:{watch_id}"}]]
+
+
+# ---------- запись в watch.json через GitHub API ----------
+
+def _gh_headers():
+    return {"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "rw-watch-script"}
+
+
+def update_watches(mutate, message):
+    """Читает watch.json из репозитория, применяет mutate(list) -> новый список или None
+    (ничего менять не нужно) и записывает с проверкой версии. При конфликте повторяет."""
+    repo = os.environ["GITHUB_REPOSITORY"]
+    branch = os.getenv("GITHUB_REF_NAME") or "main"
+    url = f"https://api.github.com/repos/{repo}/contents/{DATA_PATH}"
+    for attempt in range(4):
+        r = requests.get(url, params={"ref": branch}, headers=_gh_headers(), timeout=20)
+        if r.status_code == 404:
+            return False
+        r.raise_for_status()
+        j = r.json()
+        data = json.loads(base64.b64decode(j["content"]).decode("utf-8"))
+        watches = data.get("watches") if isinstance(data, dict) else None
+        new = mutate(list(watches or []))
+        if new is None:
+            return True
+        content = json.dumps({"watches": new}, ensure_ascii=False, indent=2) + "\n"
+        body = {"message": message, "branch": branch, "sha": j["sha"],
+                "content": base64.b64encode(content.encode("utf-8")).decode("ascii")}
+        p = requests.put(url, json=body, headers=_gh_headers(), timeout=20)
+        if p.status_code in (200, 201):
+            return True
+        if p.status_code in (409, 422):  # кто-то изменил файл раньше — повторим
+            time.sleep(0.5 * (attempt + 1))
+            continue
+        p.raise_for_status()
+    return False
+
+
+def activate(watch_id):
+    """pending -> active. True, если слежение теперь активно; False — не удалось или оно уже снято."""
+    found = {"ok": False}
+
+    def mutate(ws):
+        changed = False
+        for w in ws:
+            if str(w.get("id")) == watch_id:
+                found["ok"] = True
+                if w.get("state") == "pending":
+                    w["state"] = "active"
+                    changed = True
+        return ws if changed else None
+
+    try:
+        done = update_watches(mutate, "Начать отслеживание")
+    except Exception as e:
+        print("Не удалось активировать слежение:", type(e).__name__, e)
+        return False
+    return bool(done and found["ok"])
 
 
 # ---------- разбор страницы ----------
@@ -188,8 +282,9 @@ def check_watch(w, cache):
         raise RuntimeError(data)
     trains = select_trains(w, data)
     if not trains:
-        return "missing", ("Не нашёл такой поезд на странице. Проверь название станций, дату "
-                           "и номер поезда (с буквой, как на сайте) — или поезд снят с продажи.")
+        return "missing", ("Не нашёл такой поезд на странице. Проверь названия станций, дату "
+                           "и номер поезда (с буквой, как на сайте). Возможно, билеты на эту "
+                           "дату ещё не в продаже или поезд снят.")
     free = [t for t in trains if has_seats(t["text"])]
     if free:
         return "seats", free[0]["text"][:300]
@@ -201,6 +296,38 @@ def warn_window():
     10 минут, а раз в 6 часов (UTC 00, 06, 12, 18)."""
     t = time.gmtime()
     return t.tm_hour % 6 == 0 and t.tm_min < 10
+
+
+# ---------- первая проверка нового слежения ----------
+
+def first_check(w, status, info, error=None):
+    """Первое сообщение по новому слежению. Места есть — спрашиваем (слежение остаётся
+    pending). Мест нет / поезд не найден / сайт не ответил — запускаем слежение сами."""
+    link = route_url(w)
+    buttons = choice_buttons(w["id"])
+
+    if error is None and status == "seats":
+        safe_notify(w["chat"],
+                    f"🟢 Места уже есть!\n{card(w)}\n\nНа сайте: {info}\nКупить: {link}\n\n"
+                    "Начать отслеживание? Если не выберешь, слежение не запустится "
+                    "(кнопки действуют около получаса).",
+                    buttons)
+        return
+
+    activated = activate(w["id"])
+    if error is not None:
+        head = f"❌ Не удалось проверить сайт сейчас: {error}\nСлежение запущено — проверю при следующей проверке."
+    elif status == "missing":
+        head = f"🟡 {info}\nСлежение запущено — напишу, если поезд появится и будут места."
+    else:
+        head = "🔴 Сейчас мест нет — слежение запущено."
+    if not activated:
+        head = ("⚠️ Не удалось запустить слежение автоматически — нажми «Начать отслеживание».\n"
+                + head.split("\n")[0])
+    safe_notify(w["chat"],
+                f"{head}\n{card(w)}\n\nПроверяю раз в ~10 минут и напишу, как только появятся места.\n"
+                f"Билеты: {link}",
+                buttons)
 
 
 # ---------- прогоны ----------
@@ -218,6 +345,8 @@ def run_once(hello_id=""):
         hello = bool(hello_id) and w["id"] == hello_id
         if hello_id and not hello:
             continue
+        if not hello_id and w["state"] == "pending":
+            continue  # ждёт решения пользователя
         try:
             trip = datetime.strptime(w["date"], "%Y-%m-%d").date()
         except ValueError:
@@ -230,22 +359,20 @@ def run_once(hello_id=""):
         except Exception as e:
             print(f"[{w['id']}] ошибка: {e}")
             if hello:
-                safe_notify(w["chat"], f"❌ Не удалось проверить сайт: {e}")
+                first_check(w, None, None, error=str(e)[:150])
             continue
         print(f"[{w['id']}] {status}")
-        link = route_url(w)
         if hello:
-            state = {"seats": f"места есть! {info}", "none": "мест пока нет.",
-                     "missing": f"⚠️ {info}"}[status]
-            safe_notify(w["chat"], f"✅ Слежу за местами: {describe(w)}\nСейчас: {state}\n{link}")
+            first_check(w, status, info)
         elif status == "seats":
-            safe_notify(w["chat"], f"🚆 Появились места! {describe(w)}\n{info}\n{link}")
+            safe_notify(w["chat"],
+                        f"🟢 Появились места!\n{card(w)}\n\nНа сайте: {info}\nКупить: {route_url(w)}")
         elif status == "missing" and warn_ok:
-            safe_notify(w["chat"], f"⚠️ {describe(w)}\n{info}")
+            safe_notify(w["chat"], f"⚠️ Не нашёл поезд на странице\n{card(w)}\n\n{info}")
 
 
 def debug():
-    w = {"id": "debug", "chat": "0",
+    w = {"id": "debug", "chat": "0", "state": "active",
          "from": os.getenv("RW_FROM", "").strip(), "to": os.getenv("RW_TO", "").strip(),
          "date": os.getenv("RW_DATE", "").strip(), "train": os.getenv("RW_TRAIN", "").strip()}
     if not (w["from"] and w["to"] and w["date"]):
