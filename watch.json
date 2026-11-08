@@ -1,24 +1,3 @@
 {
-  "watches": [
-    {
-      "id": "mw3zw6xvcjq",
-      "chat": "5138748630",
-      "from": "Лунинец",
-      "to": "Минск",
-      "date": "2026-11-08",
-      "train": "860Б",
-      "state": "active",
-      "created": 1793910331939
-    },
-    {
-      "id": "mw4z8o33egy",
-      "chat": "1495284782",
-      "from": "Лунинец",
-      "to": "Минск",
-      "date": "2026-11-08",
-      "train": "860Б",
-      "state": "active",
-      "created": 1793969700591
-    }
-  ]
+  "watches": []
 }
